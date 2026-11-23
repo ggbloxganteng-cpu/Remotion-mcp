@@ -79,6 +79,40 @@ Bundle di-cache dan otomatis dibuat ulang saat file proyek berubah (`rebundle: t
 
 Output default ada di `<proyek>/out/<compositionId>.<ext>`.
 
+## Deploy remote (Railway) — mode HTTP
+
+Kalau env `PORT` ada (Railway otomatis mengisinya) atau `MCP_TRANSPORT=http`, server berjalan sebagai **Streamable HTTP** di endpoint `/mcp`. Tanpa itu, server berjalan sebagai stdio (lokal).
+
+1. **Taruh proyek Remotion di server.** Salin proyekmu ke `projects/<nama>/` di repo ini (beserta `package.json`). `Dockerfile` akan menjalankan `npm install` untuk tiap proyek. Di Railway, `projectPath` yang dipakai tool adalah path di server, mis. `/app/projects/<nama>`.
+2. **Push ke Railway.** Karena ada `Dockerfile`, Railway memakainya otomatis (butuh library sistem untuk Chromium).
+3. **Set Variables di Railway:**
+   - `MCP_AUTH_TOKEN` = string acak panjang (**wajib**; tanpa ini server menolak start)
+   - `REMOTION_MCP_ALLOWED_ROOTS` = `/app/projects` (opsional, itu defaultnya)
+4. **Buat domain publik:** Service → Settings → Networking → *Generate Domain*.
+5. **URL MCP-nya:**
+
+   ```
+   https://<domain-kamu>.up.railway.app/mcp
+   ```
+
+   Autentikasi: header `Authorization: Bearer <MCP_AUTH_TOKEN>`, atau untuk klien yang hanya menerima URL, tambahkan token di query: `https://<domain>/mcp?token=<MCP_AUTH_TOKEN>`.
+
+   Claude Code:
+
+   ```bash
+   claude mcp add --transport http remotion-render https://<domain>.up.railway.app/mcp \
+     --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+   ```
+
+6. **Cek hidup:** buka `https://<domain>/health` → harus tampil `remotion-render-mcp ok`.
+
+Catatan penting untuk mode remote:
+
+- Hasil render tersimpan di disk server. Tool mengembalikan `downloadUrl` (link acak `/d/<kunci>`) untuk mengunduh file. Disk Railway **ephemeral** (hilang saat redeploy); pasang Volume kalau butuh file bertahan, lalu arahkan `outputDir` ke path volume (dan masukkan ke `REMOTION_MCP_ALLOWED_ROOTS`).
+- Pakai `wait: false` (default) untuk render panjang, lalu cek `get_render_status`. Request HTTP yang menunggu lama bisa diputus proxy.
+- Render butuh RAM/CPU besar; kalau crash/OOM, naikkan resource service atau turunkan `concurrency` dan `scale`.
+- Mode HTTP stateless: tiap request membuat server baru, tapi daftar job tetap hidup selama proses jalan (hilang saat restart).
+
 ## Troubleshooting
 
 - **`Dependency proyek belum terpasang`** → jalankan `npm install` di proyek Remotion.
