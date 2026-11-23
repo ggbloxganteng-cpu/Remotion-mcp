@@ -13,12 +13,14 @@
  * Render berjalan sebagai job (antrian satu-per-satu) agar tidak timeout di klien MCP.
  * Gunakan wait=true untuk menunggu sampai selesai (progress dikirim lewat notifikasi MCP).
  */
+import http from "node:http";
 import path from "node:path";
 import fs from "node:fs/promises";
-import {existsSync} from "node:fs";
-import {randomUUID} from "node:crypto";
+import {createReadStream, existsSync} from "node:fs";
+import {randomBytes, randomUUID, timingSafeEqual} from "node:crypto";
 import {McpServer} from "@modelcontextprotocol/sdk/server/mcp.js";
 import {StdioServerTransport} from "@modelcontextprotocol/sdk/server/stdio.js";
+import {StreamableHTTPServerTransport} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type {RequestHandlerExtra} from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type {ServerNotification, ServerRequest} from "@modelcontextprotocol/sdk/types.js";
 import {z} from "zod";
@@ -68,10 +70,35 @@ const EXT: Record<CodecName, string> = {
 const CRF_CODECS = new Set<CodecName>(["h264", "h265", "vp8", "vp9", "h264-mkv"]);
 const AUDIO_ONLY = new Set<CodecName>(["mp3", "aac", "wav"]);
 
-const ALLOWED_ROOTS = (process.env.REMOTION_MCP_ALLOWED_ROOTS ?? "")
+// Mode HTTP (untuk deploy remote, mis. Railway): aktif kalau MCP_TRANSPORT=http atau env PORT ada.
+const HTTP_MODE = process.env.MCP_TRANSPORT === "http" || Boolean(process.env.PORT);
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN ?? "";
+const BASE_URL = (
+  process.env.PUBLIC_BASE_URL ??
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : "")
+).replace(/\/$/, "");
+
+const ENV_ROOTS = (process.env.REMOTION_MCP_ALLOWED_ROOTS ?? "")
   .split(path.delimiter)
   .filter(Boolean)
   .map((p) => path.resolve(p));
+// Di mode HTTP default-nya folder ./projects supaya server publik tidak bisa baca seluruh disk.
+const ALLOWED_ROOTS: string[] =
+  ENV_ROOTS.length > 0 ? ENV_ROOTS : HTTP_MODE ? [path.resolve("projects")] : [];
+
+// Registry file hasil render -> link download acak (tanpa membocorkan token utama).
+const downloadsByKey = new Map<string, string>();
+const downloadsByPath = new Map<string, string>();
+function downloadUrlFor(file: string): string | undefined {
+  if (!HTTP_MODE) return undefined;
+  let key = downloadsByPath.get(file);
+  if (!key) {
+    key = randomBytes(16).toString("hex");
+    downloadsByPath.set(file, key);
+    downloadsByKey.set(key, file);
+  }
+  return `${BASE_URL}/d/${key}`;
+}
 
 const BROWSER_EXECUTABLE = process.env.REMOTION_BROWSER_EXECUTABLE ?? null;
 type ChromiumOptions = NonNullable<Parameters<typeof renderMedia>[0]["chromiumOptions"]>;
@@ -255,6 +282,7 @@ function jobView(job: Job) {
       status: i.status,
       progressPercent: Math.round(i.progress * 100),
       output: i.output,
+      downloadUrl: i.output ? downloadUrlFor(i.output) : undefined,
       sizeMB: i.sizeBytes ? Number((i.sizeBytes / 1048576).toFixed(2)) : undefined,
       frames: i.durationInFrames,
       fps: i.fps,
@@ -458,6 +486,8 @@ async function waitForJob(job: Job, extra: ToolExtra) {
 // ---------------------------------------------------------------------------
 // MCP server
 // ---------------------------------------------------------------------------
+// Dibungkus fungsi supaya mode HTTP (stateless) bisa membuat server baru per request.
+function buildServer(): McpServer {
 const server = new McpServer({name: "remotion-render-mcp", version: "1.0.0"});
 
 const text = (value: unknown, isError = false) => ({
@@ -705,7 +735,12 @@ server.registerTool(
         browserExecutable: BROWSER_EXECUTABLE,
         logLevel: "warn",
       });
-      return text({output, frame: args.frame, sizeKB: Math.round((await fs.stat(output)).size / 1024)});
+      return text({
+        output,
+        downloadUrl: downloadUrlFor(output),
+        frame: args.frame,
+        sizeKB: Math.round((await fs.stat(output)).size / 1024),
+      });
     } catch (e) {
       return fail(e);
     }
@@ -766,11 +801,149 @@ server.registerTool(
   },
 );
 
+return server;
+}
+
+// ---------------------------------------------------------------------------
+// Transport: HTTP (remote) atau stdio (lokal)
+// ---------------------------------------------------------------------------
+const MIME: Record<string, string> = {
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mov": "video/quicktime",
+  ".mkv": "video/x-matroska",
+  ".gif": "image/gif",
+  ".mp3": "audio/mpeg",
+  ".aac": "audio/aac",
+  ".wav": "audio/wav",
+  ".png": "image/png",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+};
+
+function safeEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
+function isAuthorized(req: http.IncomingMessage, url: URL): boolean {
+  if (!AUTH_TOKEN) return true;
+  const header = req.headers.authorization ?? "";
+  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const supplied = bearer || url.searchParams.get("token") || "";
+  return safeEqual(supplied, AUTH_TOKEN);
+}
+
+async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > 4 * 1024 * 1024) throw new Error("Body terlalu besar.");
+    chunks.push(chunk as Buffer);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : undefined;
+}
+
+function sendJson(res: http.ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, {"Content-Type": "application/json"});
+  res.end(JSON.stringify(body));
+}
+
+async function startHttp() {
+  if (!AUTH_TOKEN && process.env.MCP_ALLOW_NO_AUTH !== "1") {
+    console.error(
+      "MCP_AUTH_TOKEN belum di-set. Endpoint publik bisa menjalankan render & menulis file, jadi token wajib. " +
+        "Set MCP_AUTH_TOKEN di environment (atau MCP_ALLOW_NO_AUTH=1 kalau benar-benar sengaja tanpa auth).",
+    );
+    process.exit(1);
+  }
+
+  const port = Number(process.env.PORT ?? 3000);
+  const httpServer = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url ?? "/", "http://localhost");
+
+      if (url.pathname === "/" || url.pathname === "/health") {
+        res.writeHead(200, {"Content-Type": "text/plain"});
+        res.end("remotion-render-mcp ok");
+        return;
+      }
+
+      // Download hasil render lewat link acak yang dikembalikan tool.
+      if (url.pathname.startsWith("/d/") && req.method === "GET") {
+        const file = downloadsByKey.get(url.pathname.slice(3));
+        if (!file || !existsSync(file)) {
+          res.writeHead(404).end("Not found");
+          return;
+        }
+        const stat = await fs.stat(file);
+        res.writeHead(200, {
+          "Content-Type": MIME[path.extname(file).toLowerCase()] ?? "application/octet-stream",
+          "Content-Length": stat.size,
+          "Content-Disposition": `attachment; filename="${path.basename(file)}"`,
+        });
+        createReadStream(file).pipe(res);
+        return;
+      }
+
+      if (url.pathname === "/mcp") {
+        if (!isAuthorized(req, url)) {
+          sendJson(res, 401, {jsonrpc: "2.0", error: {code: -32001, message: "Unauthorized"}, id: null});
+          return;
+        }
+        if (req.method !== "POST") {
+          sendJson(res, 405, {jsonrpc: "2.0", error: {code: -32000, message: "Method not allowed."}, id: null});
+          return;
+        }
+        const body = await readJsonBody(req);
+        const mcp = buildServer();
+        const transport = new StreamableHTTPServerTransport({sessionIdGenerator: undefined});
+        res.on("close", () => {
+          void transport.close();
+          void mcp.close();
+        });
+        await mcp.connect(transport);
+        await transport.handleRequest(req, res, body);
+        return;
+      }
+
+      res.writeHead(404).end("Not found");
+    } catch (e) {
+      console.error("[http error]", e);
+      if (!res.headersSent) {
+        sendJson(res, 500, {
+          jsonrpc: "2.0",
+          error: {code: -32603, message: e instanceof Error ? e.message : "Internal error"},
+          id: null,
+        });
+      } else {
+        res.end();
+      }
+    }
+  });
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.listen(port, "0.0.0.0", () => {
+    console.error(`remotion-render-mcp siap (HTTP) di port ${port}  ->  endpoint: /mcp`);
+    console.error(`Folder proyek yang diizinkan: ${ALLOWED_ROOTS.join(", ")}`);
+  });
+}
+
+async function startStdio() {
+  const transport = new StdioServerTransport();
+  await buildServer().connect(transport);
+  console.error("remotion-render-mcp siap (stdio).");
+}
+
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", r));
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error("remotion-render-mcp siap (stdio).");
+if (HTTP_MODE) {
+  await startHttp();
+} else {
+  await startStdio();
+}
