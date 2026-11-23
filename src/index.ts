@@ -81,6 +81,13 @@ const CHROMIUM_OPTIONS: ChromiumOptions = process.env.REMOTION_GL
 
 const MAX_JOBS_KEPT = 50;
 
+// Remotion mewajibkan format bitrate seperti "8M", "192k".
+type Bitrate = `${number}k` | `${number}K` | `${number}M`;
+const bitrateSchema = z
+  .string()
+  .regex(/^\d+(\.\d+)?[kKM]$/, 'Format bitrate harus seperti "8M" atau "192k".')
+  .transform((v) => v as Bitrate);
+
 // ---------------------------------------------------------------------------
 // Helper path & project
 // ---------------------------------------------------------------------------
@@ -202,8 +209,8 @@ interface RenderRequest {
   imageFormat?: "jpeg" | "png";
   muted: boolean;
   overwrite: boolean;
-  videoBitrate?: string;
-  audioBitrate?: string;
+  videoBitrate?: Bitrate;
+  audioBitrate?: Bitrate;
   timeoutInMilliseconds: number;
   props: Record<string, unknown>;
   startFrame?: number;
@@ -484,8 +491,8 @@ const renderShape = {
   imageFormat: z.enum(["jpeg", "png"]).optional().describe('Format frame perantara. Pakai "png" untuk transparansi (webm/prores).'),
   muted: z.boolean().default(false).describe("Buang audio."),
   overwrite: z.boolean().default(true).describe("Timpa file output yang sudah ada."),
-  videoBitrate: z.string().optional().describe('Mis. "8M". Alternatif dari crf.'),
-  audioBitrate: z.string().optional().describe('Mis. "192k".'),
+  videoBitrate: bitrateSchema.optional().describe('Mis. "8M". Alternatif dari crf.'),
+  audioBitrate: bitrateSchema.optional().describe('Mis. "192k".'),
   timeoutInMilliseconds: z.number().int().positive().default(120000).describe("Timeout per frame (delayRender)."),
   props: z.record(z.string(), z.unknown()).default({}).describe("inputProps untuk composition (JSON)."),
   startFrame: z.number().int().min(0).optional().describe("Frame awal (opsional, render sebagian)."),
@@ -505,8 +512,8 @@ type RenderArgs = {
   imageFormat?: "jpeg" | "png";
   muted: boolean;
   overwrite: boolean;
-  videoBitrate?: string;
-  audioBitrate?: string;
+  videoBitrate?: Bitrate;
+  audioBitrate?: Bitrate;
   timeoutInMilliseconds: number;
   props: Record<string, unknown>;
   startFrame?: number;
