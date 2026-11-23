@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "remotion-render": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/remotion-render-mcp/dist/index.js"],
+      "env": {
+        "REMOTION_MCP_ALLOWED_ROOTS": "/ABSOLUTE/PATH/ke/folder-proyek-remotion",
+        "REMOTION_GL": "angle"
+      }
+    }
+  }
+}
